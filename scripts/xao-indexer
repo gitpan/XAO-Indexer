@@ -1,0 +1,160 @@
+#!/usr/bin/perl -w
+use strict;
+use XAO::Utils;
+use XAO::Web;
+use Getopt::Long;
+
+use Data::Dumper;
+
+my $all;
+my $create;
+my $drop;
+my $project;
+my $search;
+my $update;
+my $complete;
+my $compression=0;
+GetOptions(
+    'all'           => \$all,
+    'create'        => \$create,
+    'debug'         => sub { XAO::Utils::set_debug(1) },
+    'drop'          => \$drop,
+    'project=s'     => \$project,
+    'search'        => \$search,
+    'update'        => \$update,
+    'complete'      => \$complete,
+    'compression=i' => \$compression,
+);
+
+if(!$project ||
+   ($all && @ARGV) ||
+   ($create && @ARGV!=2) ||
+   ($drop && @ARGV!=1) ||
+   ($search && @ARGV!=3) ||
+   ($update && !$all && !@ARGV)) {
+    print <<EOT;
+Usage: $0 [--debug] [--complete] --project PROJ --update index1 index2 ...
+
+Updates given indexes in the database.
+
+
+Usage: $0 [--debug] [--complete] --project PROJ --update --all
+
+Updates all existing indexes.
+
+
+Usage: $0 [--debug] \\
+    [--compression LEVEL] \\
+    --project PROJ --create index Indexer::IndexName
+
+Creates a new index with given name and using given class name to handle
+it. Does not build index data, only prepares data structures.
+
+
+Usage: $0 [--debug] --project PROJ --drop index
+
+Drops the given existing index.
+
+
+Usage: $0 [--debug] --project PROJ --search index ordering 'search string'
+
+Performes a search on the given index and returns found unique IDs one
+per line on standard output. Mostly useful for testing.
+
+EOT
+    exit 1;
+}
+
+my $site=XAO::Web->new(sitename => $project);
+$site->set_current();
+my $config=$site->config;
+my $odb=$config->odb();
+
+##
+# Loading top level. Name is hard-coded.
+#
+if(!$odb->fetch('/')->exists('Indexes')) {
+    die "No '/Indexes' in the project's database\n";
+}
+my $index_list=$odb->fetch('/Indexes');
+
+##
+# Searching
+#
+if($search) {
+    my ($i_name,$ordering,$str)=@ARGV;
+    my $index=$index_list->get($i_name);
+    my $sr=$index->search_by_string($ordering,$str);
+    print join("\n",@$sr),"\n";
+    exit 0;
+}
+
+##
+# Creating new index structure
+#
+if($create) {
+    my ($i_name,$i_class)=@ARGV;
+
+    my $i_obj=XAO::Objects->new(objname => $i_class);
+    $i_obj->can('get_orderings') ||
+        die "Indexer object '$i_class' has no 'get_orderings' method\n";
+
+    $index_list->check_name($i_name) ||
+        die "Bad name for an index '$i_name'\n";
+
+    $odb->transact_begin;
+
+    $index_list->exists($i_name) &&
+        die "Index with such name ($i_name) already exists\n";
+
+    dprint "Storing new index object";
+    my $ni=$index_list->get_new;
+    $ni->put(
+        indexer_objname => $i_class,
+        compression     => $compression,
+    );
+    $index_list->put($i_name => $ni);
+
+    dprint "Done";
+    $odb->transact_commit;
+    exit 0;
+}
+
+##
+# Drops an index
+#
+if($drop) {
+    my $i_name=$ARGV[0];
+    dprint "Dropping index '$i_name'";
+    $odb->transact_begin;
+    $index_list->delete($i_name) if $index_list->exists($i_name);
+    $odb->transact_commit;
+    exit 0;
+}
+
+##
+# Updating existing indexes
+#
+if($update) {
+    dprint "Updating indexes";
+    foreach my $index_id ($all ? $index_list->keys : @ARGV) {
+        dprint "Updating index '$index_id'";
+        my ($ucount,$is_partial);
+        do {
+            ($ucount,$is_partial)=$index_list->get($index_id)->update;
+            dprint ".updated $ucount IDs";
+        } while($complete && $ucount && $is_partial);
+    }
+    exit 0;
+}
+
+die "Unknown mode of operation, run without arguments to see usage info\n";
+
+###############################################################################
+
+sub END {
+    if($odb && $odb->transact_active) {
+        eprint "Rolling back transaction..";
+        $odb->transact_rollback;
+    }
+}
